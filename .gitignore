@@ -1,0 +1,16 @@
+# Result data
+output/
+result/
+gee_output/
+
+# Credentials
+*.json
+!requirements.txt
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Docker
+.dockerignore

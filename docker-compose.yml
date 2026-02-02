@@ -1,0 +1,22 @@
+services:
+  gee-pipeline:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./output:/app/output
+      - ./result:/app/result
+      - ./models:/app/models
+      - ./district shapefiles:/app/district shapefiles
+      - ./api.py:/app/api.py
+      - ./gee_punjab_lulc_downloader_v2.py:/app/gee_punjab_lulc_downloader_v2.py
+      - ./gee_bulk_s2_rabi_downloader.py:/app/gee_bulk_s2_rabi_downloader.py
+      - ./gee_bulk_rabi_inference.py:/app/gee_bulk_rabi_inference.py
+      - ./salehazainab-key.json:/app/salehazainab-key.json
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G # Recommended to handle tiling comfortably
