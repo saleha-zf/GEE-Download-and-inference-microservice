@@ -52,7 +52,7 @@ def run_inference(df_chunk):
     df_chunk.replace([np.inf, -np.inf], 0, inplace=True)
     df_chunk.fillna(0, inplace=True)
     
-    weight_xgb, weight_cat = 0.6, 0.4
+    weight_xgb, weight_cat = 0.4, 0.6
     
     # XGBoost
     X_xgb = df_chunk.reindex(columns=_models['xgb_features']).fillna(0).astype(np.float32)
@@ -71,7 +71,7 @@ def run_inference(df_chunk):
     return preds, confs
 
 def process_district(district_name):
-    print(f"\n🚜 Starting Inference for {district_name}...")
+    print(f"\n🚜 Starting Dynamic Inference for {district_name}...")
     dist_input_dir = os.path.join(INPUT_DIR, district_name.replace(" ", "_"))
     dist_result_dir = os.path.join(RESULT_DIR, district_name.replace(" ", "_"))
     tiles_dir = os.path.join(dist_result_dir, "tiles")
@@ -82,31 +82,33 @@ def process_district(district_name):
         print(f"   ⏩ {district_name} map already exists. Skipping.")
         return
 
-    # Inputs configuration
-    month_files = [
-        f"{dist_input_dir}/{district_name}_2025-10.tif",
-        f"{dist_input_dir}/{district_name}_2025-11.tif",
-        f"{dist_input_dir}/{district_name}_2025-12.tif",
-        f"{dist_input_dir}/{district_name}_2026-01.tif"
-    ]
-    # Check if all 4 months exist
-    if not all(os.path.exists(f) for f in month_files):
-        missing = [f for f in month_files if not os.path.exists(f)]
-        print(f"   ⚠️ Skipping {district_name}. Missing Sentinel inputs: {missing}")
+    # 🔎 DYNAMICALLY FIND SENTINEL INPUTS (YYYY-MM.tif)
+    pattern = os.path.join(dist_input_dir, f"{district_name}_202[0-9]-[0-9][0-9].tif")
+    month_files = sorted(glob.glob(pattern))
+    
+    if not month_files:
+        print(f"   ⚠️ Skipping {district_name}. No Sentinel inputs found in {dist_input_dir}")
         return
+
+    print(f"   📂 Found {len(month_files)} months: {[os.path.basename(f) for f in month_files]}")
 
     lulc_file = f"{dist_input_dir}/{district_name}_LULC_2526_final.tif"
     if not os.path.exists(lulc_file):
         print(f"   ⚠️ Skipping {district_name}. Missing LULC file.")
         return
 
-    # Load 4 months, proxy the rest from M4 (Persistence)
+    # Load available months
     src_files = [rasterio.open(f) for f in month_files]
-    # Replicate M4 for M5-M8
-    full_src_list = src_files + [src_files[3]] * 4
+    
+    # Logic: If we have < 8 months, replicate the latest available month to fill M1-M8
+    # If we have [M1, M2, M3, M4], the list becomes [M1, M2, M3, M4, M4, M4, M4, M4]
+    latest_src = src_files[-1]
+    full_src_list = src_files + [latest_src] * (8 - len(src_files))
+    # Cap at 8 if we somehow had more
+    full_src_list = full_src_list[:8]
     
     lulc_src = rasterio.open(lulc_file)
-    ref_src = src_files[3] # Jan as reference
+    ref_src = latest_src # Use most recent month as reference for geometry
     width, height = ref_src.width, ref_src.height
     transform, crs = ref_src.transform, ref_src.crs
     
