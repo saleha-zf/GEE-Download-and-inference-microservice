@@ -176,28 +176,17 @@ def process_district(district_name):
                               dtype='uint8', crs=crs, transform=rasterio.windows.transform(window, transform), nodata=255) as out:
                 out.write(grid, 1)
 
-    # Merge tiles into a temporary WGS84/UTM TIF
-    print(f"🏗️ Merging {district_name} tiles...")
-    tile_files = glob.glob(f"{tiles_dir}/tile_*.tif")
-    temp_merged = os.path.join(dist_result_dir, "temp_merged.tif")
+def generate_cog(temp_wgs84_path, output_cog_path):
+    """Matches the tile_merger.py architecture for professional COG generation."""
+    print(f"🔁 Reprojecting to EPSG:3857 (Web Mercator) at 10m resolution...")
+    repro_tif = output_cog_path.replace(".tif", "_repro.tif")
     
-    with rasterio.open(temp_merged, 'w', driver='GTiff', height=height, width=width, count=1, 
-                      dtype='uint8', crs=crs, transform=transform, nodata=255, compress='lzw', tiled=True) as dst:
-        for tif in tile_files:
-            with rasterio.open(tif) as ts:
-                coords = os.path.basename(tif).replace('.tif','').split('_')
-                dst.write(ts.read(1), 1, window=Window(int(coords[2]), int(coords[1]), ts.width, ts.height))
-
-    # --- COG GENERATION LOGIC (from tile_merger.py) ---
-    print(f"🔁 Reprojecting {district_name} to EPSG:3857 (Web Mercator)...")
-    repro_tif = os.path.join(dist_result_dir, "temp_3857.tif")
-    
-    with rasterio.open(temp_merged) as src:
-        # Calculate transform for 10m resolution in 3857
-        # Note: 10m in 4326 is approx 0.00009 degrees, but in 3857 it's exactly 10 units.
+    with rasterio.open(temp_wgs84_path) as src:
+        # 1. Calculate the ideal 10m transform in Web Mercator
         transform_3857, width_3857, height_3857 = calculate_default_transform(
             src.crs, "EPSG:3857", src.width, src.height, *src.bounds, resolution=10
         )
+        
         kwargs = src.meta.copy()
         kwargs.update({
             "crs": "EPSG:3857",
@@ -207,9 +196,12 @@ def process_district(district_name):
             "compress": "DEFLATE",
             "tiled": True,
             "blockxsize": 512,
-            "blockysize": 512
+            "blockysize": 512,
+            "nodata": 255,
+            "dtype": "uint8"
         })
         
+        # 2. Perform the Reprojection
         with rasterio.open(repro_tif, "w", **kwargs) as dst:
             reproject(
                 source=rasterio.band(src, 1),
@@ -220,21 +212,122 @@ def process_district(district_name):
                 dst_crs="EPSG:3857",
                 resampling=Resampling.nearest
             )
-            # Add metadata tags for classes
+            # 3. Add same Metadata tags as tile_merger.py
             dst.update_tags(**{f"class_{idx}": cls for cls, idx in FIXED_CLASS_MAPPING.items()})
+            dst.update_tags(OVR_RESAMPLING_ALG="NEAREST", AREA_OR_POINT="Area")
 
-    print(f"🛠 Creating Cloud Optimized GeoTIFF (COG) for {district_name}...")
+    # 4. Final COG Translation (Internal tiling and overviews)
+    print("🛠 Finalizing Cloud Optimized GeoTIFF...")
     cog_profile = cog_profiles.get("lzw")
-    cog_translate(repro_tif, output_crop_map, cog_profile, in_memory=False, quiet=True)
+    cog_translate(repro_tif, output_cog_path, cog_profile, in_memory=False, quiet=True)
     
-    # Cleanup temporary files
-    if os.path.exists(temp_merged): os.remove(temp_merged)
+    # Clean up intermediate files
     if os.path.exists(repro_tif): os.remove(repro_tif)
-    # Optional: cleanup tiles directory
-    # import shutil
-    # if os.path.exists(tiles_dir): shutil.rmtree(tiles_dir)
+    print(f"✅ COG saved to: {output_cog_path}")
 
-    print(f"✅ {district_name} COG COMPLETE: {output_crop_map}")
+def process_district(district_name):
+    print(f"\n🚜 Starting Inference for {district_name}...")
+    dist_input_dir = os.path.join(INPUT_DIR, district_name.replace(" ", "_"))
+    dist_result_dir = os.path.join(RESULT_DIR, district_name.replace(" ", "_"))
+    tiles_dir = os.path.join(dist_result_dir, "tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+    
+    output_crop_map = os.path.join(dist_result_dir, f"{district_name}_Rabi_2526_CropMap.tif")
+    if os.path.exists(output_crop_map):
+        print(f"   ⏩ {district_name} map already exists. Skipping.")
+        return
+
+    # 🔎 Dynamic Detection of months
+    pattern = os.path.join(dist_input_dir, f"{district_name}_202[0-9]-[0-9][0-9].tif")
+    month_files = sorted(glob.glob(pattern))
+    
+    if not month_files:
+        print(f"   ⚠️ Skipping {district_name}. No Sentinel inputs found.")
+        return
+
+    lulc_file = f"{dist_input_dir}/{district_name}_LULC_2526_final.tif"
+    if not os.path.exists(lulc_file):
+        print(f"   ⚠️ Skipping {district_name}. Missing LULC file.")
+        return
+
+    # Prepare Source Handles
+    src_files = [rasterio.open(f) for f in month_files]
+    latest_src = src_files[-1]
+    full_src_list = src_files + [latest_src] * (8 - len(src_files))
+    full_src_list = full_src_list[:8]
+    
+    lulc_src = rasterio.open(lulc_file)
+    ref_src = latest_src
+    width, height = ref_src.width, ref_src.height
+    transform, crs = ref_src.transform, ref_src.crs
+    
+    tile_size = 1200
+    for y in range(0, height, tile_size):
+        for x in range(0, width, tile_size):
+            h, w = min(tile_size, height-y), min(tile_size, width-x)
+            window = Window(x, y, w, h)
+            tile_tif = os.path.join(tiles_dir, f"tile_{y}_{x}.tif")
+            if os.path.exists(tile_tif): continue
+
+            # Masking using NDVI
+            mask_data = ref_src.read(3, window=window)
+            valid_mask = (mask_data != 0) & np.isfinite(mask_data)
+            
+            if not np.any(valid_mask):
+                with rasterio.open(tile_tif, 'w', driver='GTiff', height=h, width=w, count=1, 
+                                  dtype='uint8', crs=crs, transform=rasterio.windows.transform(window, transform), nodata=255) as out:
+                    out.write(np.full((h, w), 255, dtype='uint8'), 1)
+                continue
+
+            rows, cols = np.where(valid_mask)
+            lons, lats = rasterio.windows.transform(window, transform) * (cols, rows)
+            tile_df = pd.DataFrame({'Latitude': lats, 'Longitude': lons})
+            
+            # Feature extraction
+            band_names = ['B11', 'EVI', 'NDVI', 'NDWI', 'SAVI']
+            for m_idx, s_src in enumerate(full_src_list, start=1):
+                for b_idx, b_name in enumerate(band_names, start=1):
+                    data = s_src.read(b_idx, window=window)
+                    tile_df[f"{b_name}_M{m_idx}"] = data[rows, cols].astype(np.int32)
+
+            dw_bands = ['bare', 'built', 'crops', 'flooded_vegetation', 'grass', 'shrub_and_scrub', 'trees', 'water']
+            for b_idx, b_name in enumerate(dw_bands, start=1):
+                data = lulc_src.read(b_idx, window=window)
+                tile_df[f"DW_{b_name}"] = data[rows, cols].astype(np.int32)
+            
+            nv = tile_df[[f"NDVI_M{m}" for m in range(1, 9)]].values.astype(np.float32) / 10000.0
+            tile_df['ndvi_max'] = (np.max(nv, axis=1)*10000).astype(np.int32)
+            tile_df['ndvi_min'] = (np.min(nv, axis=1)*10000).astype(np.int32)
+            tile_df['ndvi_amplitude'] = tile_df['ndvi_max'] - tile_df['ndvi_min']
+            tile_df['ndvi_auc'] = (np.sum(nv, axis=1)*10000).astype(np.int32)
+            tile_df['ndvi_time_of_max_idx'] = (np.argmax(nv, axis=1) + 1).astype(np.uint8)
+
+            preds, _ = run_inference(tile_df)
+            
+            grid = np.full((h, w), 255, dtype='uint8')
+            grid[rows, cols] = [FIXED_CLASS_MAPPING.get(p, 255) for p in preds]
+            
+            with rasterio.open(tile_tif, 'w', driver='GTiff', height=h, width=w, count=1, 
+                              dtype='uint8', crs=crs, transform=rasterio.windows.transform(window, transform), nodata=255) as out:
+                out.write(grid, 1)
+
+    # 🏗️ Merge tiles into temporary master
+    temp_master = os.path.join(dist_result_dir, "wgs84_master.tif")
+    print(f"🏗️ Merging tiles for {district_name}...")
+    with rasterio.open(temp_master, 'w', driver='GTiff', height=height, width=width, count=1, 
+                      dtype='uint8', crs=crs, transform=transform, nodata=255) as dst:
+        tile_files = glob.glob(f"{tiles_dir}/tile_*.tif")
+        for tif in tile_files:
+            with rasterio.open(tif) as ts:
+                name_parts = os.path.basename(tif).replace('.tif','').split('_')
+                dst.write(ts.read(1), 1, window=Window(int(name_parts[2]), int(name_parts[1]), ts.width, ts.height))
+
+    # 🚀 Generate the Professional COG
+    generate_cog(temp_master, output_crop_map)
+
+    # Cleanup
+    if os.path.exists(temp_master): os.remove(temp_master)
+    print(f"✅ DISTRICT {district_name} COMPLETE.")
 
 if __name__ == "__main__":
     load_models()
