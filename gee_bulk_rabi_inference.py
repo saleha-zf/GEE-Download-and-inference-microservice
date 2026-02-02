@@ -11,6 +11,10 @@ import xgboost as xgb
 import gc
 import glob
 import shapefile
+from rasterio.merge import merge
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rio_cogeo.cogeo import cog_translate
+from rio_cogeo.profiles import cog_profiles
 
 # ==============================================================================
 # ⚙️ CONFIGURATION
@@ -22,9 +26,16 @@ MODEL_PATH = f"{BASE_DIR}/models/{SEASON}"
 RESULT_DIR = f"{BASE_DIR}/result/Rabi_25_26"
 SHAPEFILE_PATH = "/app/district shapefiles/pak_admin2.shp"
 
+# Frontend expects: 0=Wheat, 1=Rice, 2=Maize, 3=Cotton, 4=Sugarcane, 5=Vegetation, 6=Bare/Fallow, 7=Water
 FIXED_CLASS_MAPPING = {
-    'Bare / Fallow': 0, 'Maize': 1, 'Sugarcane': 2,
-    'Vegetation / Other Crops': 3, 'Water': 4, 'Wheat': 5
+    'Wheat': 0,
+    'Rice': 1,
+    'Maize': 2,
+    'Cotton': 3,
+    'Sugarcane': 4,
+    'Vegetation / Other Crops': 5,
+    'Bare / Fallow': 6,
+    'Water': 7
 }
 
 _models = {}
@@ -165,16 +176,65 @@ def process_district(district_name):
                               dtype='uint8', crs=crs, transform=rasterio.windows.transform(window, transform), nodata=255) as out:
                 out.write(grid, 1)
 
-    # Merge tiles
+    # Merge tiles into a temporary WGS84/UTM TIF
     print(f"🏗️ Merging {district_name} tiles...")
     tile_files = glob.glob(f"{tiles_dir}/tile_*.tif")
-    with rasterio.open(output_crop_map, 'w', driver='GTiff', height=height, width=width, count=1, 
+    temp_merged = os.path.join(dist_result_dir, "temp_merged.tif")
+    
+    with rasterio.open(temp_merged, 'w', driver='GTiff', height=height, width=width, count=1, 
                       dtype='uint8', crs=crs, transform=transform, nodata=255, compress='lzw', tiled=True) as dst:
         for tif in tile_files:
             with rasterio.open(tif) as ts:
                 coords = os.path.basename(tif).replace('.tif','').split('_')
                 dst.write(ts.read(1), 1, window=Window(int(coords[2]), int(coords[1]), ts.width, ts.height))
-    print(f"✅ {district_name} COMPLETE.")
+
+    # --- COG GENERATION LOGIC (from tile_merger.py) ---
+    print(f"🔁 Reprojecting {district_name} to EPSG:3857 (Web Mercator)...")
+    repro_tif = os.path.join(dist_result_dir, "temp_3857.tif")
+    
+    with rasterio.open(temp_merged) as src:
+        # Calculate transform for 10m resolution in 3857
+        # Note: 10m in 4326 is approx 0.00009 degrees, but in 3857 it's exactly 10 units.
+        transform_3857, width_3857, height_3857 = calculate_default_transform(
+            src.crs, "EPSG:3857", src.width, src.height, *src.bounds, resolution=10
+        )
+        kwargs = src.meta.copy()
+        kwargs.update({
+            "crs": "EPSG:3857",
+            "transform": transform_3857,
+            "width": width_3857,
+            "height": height_3857,
+            "compress": "DEFLATE",
+            "tiled": True,
+            "blockxsize": 512,
+            "blockysize": 512
+        })
+        
+        with rasterio.open(repro_tif, "w", **kwargs) as dst:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=rasterio.band(dst, 1),
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform_3857,
+                dst_crs="EPSG:3857",
+                resampling=Resampling.nearest
+            )
+            # Add metadata tags for classes
+            dst.update_tags(**{f"class_{idx}": cls for cls, idx in FIXED_CLASS_MAPPING.items()})
+
+    print(f"🛠 Creating Cloud Optimized GeoTIFF (COG) for {district_name}...")
+    cog_profile = cog_profiles.get("lzw")
+    cog_translate(repro_tif, output_crop_map, cog_profile, in_memory=False, quiet=True)
+    
+    # Cleanup temporary files
+    if os.path.exists(temp_merged): os.remove(temp_merged)
+    if os.path.exists(repro_tif): os.remove(repro_tif)
+    # Optional: cleanup tiles directory
+    # import shutil
+    # if os.path.exists(tiles_dir): shutil.rmtree(tiles_dir)
+
+    print(f"✅ {district_name} COG COMPLETE: {output_crop_map}")
 
 if __name__ == "__main__":
     load_models()

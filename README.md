@@ -138,18 +138,20 @@ To verify your setup quickly, use Islamabad as a test case:
 
 ---
 
-## 🎨 Crop Map Legend
+## 🎨 Crop Map Legend & Format
 
-The resulting GeoTIFF values represent the following classes:
+The output is a **Cloud Optimized GeoTIFF (COG)** in **EPSG:3857** (Web Mercator) with a **10m resolution**. This format is optimized for web mapping and high-speed tiling.
 
 | Value | Class Name |
 | :--- | :--- |
-| **0** | Bare / Fallow |
-| **1** | Maize |
-| **2** | Sugarcane |
-| **3** | Vegetation / Other Crops |
-| **4** | Water |
-| **5** | Wheat |
+| **0** | Wheat |
+| **1** | Rice |
+| **2** | Maize |
+| **3** | Cotton |
+| **4** | Sugarcane |
+| **5** | Vegetation / Other Crops |
+| **6** | Bare / Fallow |
+| **7** | Water |
 | **255** | No Data (Masked Area) |
 
 ---
