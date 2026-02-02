@@ -136,6 +136,24 @@ To verify your setup quickly, use Islamabad as a test case:
 
 ---
 
+---
+
+## 🎨 Crop Map Legend
+
+The resulting GeoTIFF values represent the following classes:
+
+| Value | Class Name |
+| :--- | :--- |
+| **0** | Bare / Fallow |
+| **1** | Maize |
+| **2** | Sugarcane |
+| **3** | Vegetation / Other Crops |
+| **4** | Water |
+| **5** | Wheat |
+| **255** | No Data (Masked Area) |
+
+---
+
 ## 🛡️ Best Practices
 - **Persistence:** The container is set to `unless-stopped` to ensure tasks continue if the host restarts.
 - **Memory:** Tiling is configured for 1200px. If running on low-memory systems, you can reduce `tile_size` in `gee_bulk_rabi_inference.py`.
